@@ -516,11 +516,44 @@ def attention_decode_forward_ref_impl(
         layout: Literal["bshd"], 
         cache_seqlens: Optional[torch.Tensor], 
         cache_batch_idx: Optional[torch.Tensor],
+        block_table: Optional[torch.Tensor] = None,
 ):
     """Compute reference output for decode attention using PyTorch's built-in functions"""
     
     # get batch size before any layout conversion
     batch_size = q.shape[0]
+    
+    # Check if we're using paged KV cache
+    is_paged = block_table is not None
+    
+    if is_paged:
+        # For paged KV cache, k_cache and v_cache have shape:
+        # [num_blocks, block_size, nheads, head_dim]
+        # block_table has shape: [batch_size, num_blocks_per_seq]
+        # We need to reconstruct the logical k_cache and v_cache from the paged format
+        
+        num_blocks, block_size, nheads_k, d = k_cache.shape
+        batch_size_bt, num_blocks_per_seq = block_table.shape
+        assert batch_size == batch_size_bt, f"Batch size mismatch: {batch_size} vs {batch_size_bt}"
+        
+        # Reconstruct the logical cache from paged format for each batch
+        max_cache_len = num_blocks_per_seq * block_size
+        k_cache_logical = torch.zeros(batch_size, max_cache_len, nheads_k, d, 
+                                      device=k_cache.device, dtype=k_cache.dtype)
+        v_cache_logical = torch.zeros(batch_size, max_cache_len, nheads_k, d, 
+                                      device=v_cache.device, dtype=v_cache.dtype)
+        
+        for b in range(batch_size):
+            for block_idx in range(num_blocks_per_seq):
+                physical_block = block_table[b, block_idx].item()
+                start_pos = block_idx * block_size
+                end_pos = start_pos + block_size
+                k_cache_logical[b, start_pos:end_pos] = k_cache[physical_block]
+                v_cache_logical[b, start_pos:end_pos] = v_cache[physical_block]
+        
+        # Use the logical cache for computation
+        k_cache = k_cache_logical
+        v_cache = v_cache_logical
     
     # handle cache_batch_idx
     if cache_batch_idx is not None:
@@ -549,6 +582,7 @@ def attention_decode_forward_ref_impl(
             end_pos = start_pos + seq_len_new
             
             # copy new keys and values into cache (both are in bshd layout)
+            # For paged cache, we already have the logical cache
             k_cache[cache_idx, start_pos:end_pos, :, :] = k_new[b, :, :, :]
             v_cache[cache_idx, start_pos:end_pos, :, :] = v_new[b, :, :, :]
     

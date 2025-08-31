@@ -899,6 +899,7 @@ def fwd_kvcache(
                 metadata.layout,
                 metadata.cache_seqlens,
                 metadata.cache_batch_idx,
+                block_table,
             )
         softmax_lse=softmax_lse_ref
     else:
