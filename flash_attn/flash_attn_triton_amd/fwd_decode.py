@@ -76,6 +76,7 @@ def _fwd_kernel_splitK(
     V_new,
     Cache_seqlens,
     Cache_batch_idx,
+    Block_table,
     Alibi_slopes,
     stride_qz,
     stride_qm,
@@ -110,6 +111,8 @@ def _fwd_kernel_splitK(
     stride_vn_g,
     stride_vn_h,
     stride_vn_d,
+    stride_bt_b,
+    stride_bt_s,
     stride_az, 
     stride_ah,
     Z,
@@ -117,6 +120,7 @@ def _fwd_kernel_splitK(
     N_CTX_K,
     N_CTX_NEW,
     BLOCK_N_PER_SPLIT,
+    BLOCK_SIZE_K: tl.constexpr,
     H_q: tl.constexpr,
     H_kv: tl.constexpr,
     G_q: tl.constexpr,
@@ -136,6 +140,7 @@ def _fwd_kernel_splitK(
     USE_SLIDING_WINDOW: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
+    USE_BLOCK_TABLE: tl.constexpr,
 ):
     # get program ids
     pid_m = tl.program_id(0)
@@ -181,8 +186,15 @@ def _fwd_kernel_splitK(
     # compute ptrs
     q_offset = Q + hq_id * stride_qh + z_id * stride_qz + g_id * stride_qg
     q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    k_offset = K + hk_id * stride_kh + cache_batch_idx * stride_kz + g_id * stride_kg
-    v_offset = V + hv_id * stride_vh + cache_batch_idx * stride_vz + g_id * stride_vg
+    
+    # Handle block table for paged attention
+    if USE_BLOCK_TABLE:
+        # K and V now point to paged cache
+        # Each batch has its own block table row
+        block_table_ptr = Block_table + z_id * stride_bt_b
+    else:
+        k_offset = K + hk_id * stride_kh + cache_batch_idx * stride_kz + g_id * stride_kg
+        v_offset = V + hv_id * stride_vh + cache_batch_idx * stride_vz + g_id * stride_vg
 
     # compute masks
     if PADDED_HEAD:
@@ -276,96 +288,171 @@ def _fwd_kernel_splitK(
 
 
     # loop over k, v and update accumulator
-    for start_n in range(lo, hi, BLOCK_N):
-        kT_ptrs = k_offset + offs_d[:, None] * stride_kd + (start_n + offs_n)[None, :] * stride_kn
-        V_ptrs = v_offset + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vd
-
-        # load k
-        kT = tl.load(kT_ptrs, mask=kT_mask, other=0.0)
-        v = tl.load(V_ptrs, mask=v_mask, other=0.0)
-
-        # -- compute qk ---
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, kT)  # noqa: F821
-
-        if USE_ALIBI:
-            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            col_idx = start_n + tl.arange(0, BLOCK_N)
+    if USE_BLOCK_TABLE:
+        # Simple paged attention - basic case only (no causal/sliding window/alibi for now)
+        num_kv_blocks = (N_CTX_K_FINAL + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+        
+        for block_idx in range(num_kv_blocks):
+            # Calculate sequence range for this block
+            block_start = block_idx * BLOCK_SIZE_K
+            block_end = tl.minimum(block_start + BLOCK_SIZE_K, N_CTX_K_FINAL)
             
-            # Compute relative positions
-            relative_pos = row_idx[:, None] + N_CTX_K_FINAL - (N_CTX_Q + col_idx[None, :])
-            relative_pos = tl.abs(relative_pos)
-            
-            # Compute ALiBi bias
-            alibi_bias = -1 * alibi_slope * relative_pos
-            qk += (alibi_bias * 1.44269504)
+            # Check if block overlaps with our split-k range [lo, hi)
+            if block_end > lo and block_start < hi:
+                # Load physical block number
+                physical_block = tl.load(block_table_ptr + block_idx * stride_bt_s)
+                
+                # Calculate the range within this block that overlaps with [lo, hi)
+                process_start = tl.maximum(lo - block_start, 0)
+                process_end = tl.minimum(hi - block_start, BLOCK_SIZE_K)
+                process_end = tl.minimum(process_end, block_end - block_start)
+                
+                # Align to BLOCK_N boundaries
+                process_start = (process_start // BLOCK_N) * BLOCK_N
+                
+                for offset in range(process_start, process_end, BLOCK_N):
+                    # Current position in the sequence
+                    seq_pos = block_start + offset
+                    
+                    # Only process if in range
+                    if seq_pos < hi and seq_pos >= lo:
+                        # Calculate base addresses for K and V in this physical block
+                        k_base = K + physical_block * BLOCK_SIZE_K * stride_kn + hk_id * stride_kh + g_id * stride_kg
+                        v_base = V + physical_block * BLOCK_SIZE_K * stride_vn + hv_id * stride_vh + g_id * stride_vg
+                        
+                        # Offsets within the current block
+                        block_offs = offset + offs_n
+                        
+                        # Masks for valid data
+                        seq_mask = ((seq_pos + offs_n) < N_CTX_K_FINAL)
+                        block_mask = (block_offs < BLOCK_SIZE_K)
+                        valid_mask = seq_mask & block_mask
+                        
+                        # Apply masks
+                        kT_mask_final = kT_mask & valid_mask[None, :]
+                        v_mask_final = v_mask & valid_mask[:, None]
+                        
+                        # Load K and V
+                        kT_ptrs = k_base + offs_d[:, None] * stride_kd + block_offs[None, :] * stride_kn
+                        v_ptrs = v_base + block_offs[:, None] * stride_vn + offs_d[None, :] * stride_vd
+                        
+                        kT = tl.load(kT_ptrs, mask=kT_mask_final, other=0.0)
+                        v = tl.load(v_ptrs, mask=v_mask_final, other=0.0)
+                        
+                        # Compute attention scores
+                        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+                        qk += tl.dot(q, kT)
+                        
+                        # Basic masking for invalid positions
+                        qk = tl.where(valid_mask[None, :], qk, float("-inf"))
+                        
+                        # Compute softmax
+                        m_i_new = tl.maximum(m_i, tl.max(qk, 1))
+                        alpha = tl.math.exp2(m_i - m_i_new)
+                        beta = tl.math.exp2(tl.max(qk, 1) - m_i_new)
+                        
+                        # Compute probabilities
+                        p = tl.math.exp2(qk - m_i_new[:, None])
+                        
+                        # Update running statistics
+                        l_i = l_i * alpha + tl.sum(p, 1) * beta
+                        m_i = m_i_new
+                        p = p.to(Q.dtype.element_ty)
+                        
+                        # Update accumulator
+                        acc *= alpha[:, None]
+                        acc += tl.dot(p.to(v.dtype), v)
+    else:
+        for start_n in range(lo, hi, BLOCK_N):
+            kT_ptrs = k_offset + offs_d[:, None] * stride_kd + (start_n + offs_n)[None, :] * stride_kn
+            V_ptrs = v_offset + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vd
 
-        # ------------------------------------------------------------------
-        # masking
-        # ------------------------------------------------------------------
-        if USE_SLIDING_WINDOW:
-            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # q positions
-            col_idx = start_n + tl.arange(0, BLOCK_N)                # k positions
-            row = row_idx[:, None]                                   # [M,1]
-            col = col_idx[None, :]                                   # [1,N]
-    
-            if IS_CAUSAL:
-                # -------- causal + window --------
-                diag      = N_CTX_K_FINAL - N_CTX_Q                  # sk-sq
-                causal_ok = col <= row + diag
-                if WINDOW_SIZE_LEFT < 0:                             # only right window
-                    win_ok = col <= row + diag + WINDOW_SIZE_RIGHT
-                else:                                                # both sides
-                    win_ok = ((col >= row + diag - WINDOW_SIZE_LEFT) &
-                                (col <= row + diag + WINDOW_SIZE_RIGHT))
-                mask = ~(causal_ok & win_ok)                         # True ⇒ -inf
-            else:
-                # -------- non-causal window --------
-                sk, sq = N_CTX_K_FINAL, N_CTX_Q
-                if WINDOW_SIZE_LEFT < 0:
-                    mask = col > row + (sk - sq) + WINDOW_SIZE_RIGHT
-                else:
-                    right = tl.minimum(row + (sk - sq) + WINDOW_SIZE_RIGHT, sk)
-                    left  = row + (sk - sq) - WINDOW_SIZE_LEFT
-                    mask  = (col > right) | (col < left)
-            qk = tl.where(mask, float("-inf"), qk)
-        else:
-            if IS_CAUSAL:
+            # load k
+            kT = tl.load(kT_ptrs, mask=kT_mask, other=0.0)
+            v = tl.load(V_ptrs, mask=v_mask, other=0.0)
+
+            # -- compute qk ---
+            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            qk += tl.dot(q, kT)  # noqa: F821
+
+            if USE_ALIBI:
                 row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
                 col_idx = start_n + tl.arange(0, BLOCK_N)
+                
+                # Compute relative positions
+                relative_pos = row_idx[:, None] + N_CTX_K_FINAL - (N_CTX_Q + col_idx[None, :])
+                relative_pos = tl.abs(relative_pos)
+                
+                # Compute ALiBi bias
+                alibi_bias = -1 * alibi_slope * relative_pos
+                qk += (alibi_bias * 1.44269504)
 
-                # create a N_CTX_Q x kv_len causal mask
-                col_offset = N_CTX_Q - N_CTX_K_FINAL
-                causal_mask = row_idx[:, None] >= (col_offset + col_idx[None, :])
+            # ------------------------------------------------------------------
+            # masking
+            # ------------------------------------------------------------------
+            if USE_SLIDING_WINDOW:
+                row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # q positions
+                col_idx = start_n + tl.arange(0, BLOCK_N)                # k positions
+                row = row_idx[:, None]                                   # [M,1]
+                col = col_idx[None, :]                                   # [1,N]
+        
+                if IS_CAUSAL:
+                    # -------- causal + window --------
+                    diag      = N_CTX_K_FINAL - N_CTX_Q                  # sk-sq
+                    causal_ok = col <= row + diag
+                    if WINDOW_SIZE_LEFT < 0:                             # only right window
+                        win_ok = col <= row + diag + WINDOW_SIZE_RIGHT
+                    else:                                                # both sides
+                        win_ok = ((col >= row + diag - WINDOW_SIZE_LEFT) &
+                                    (col <= row + diag + WINDOW_SIZE_RIGHT))
+                    mask = ~(causal_ok & win_ok)                         # True ⇒ -inf
+                else:
+                    # -------- non-causal window --------
+                    sk, sq = N_CTX_K_FINAL, N_CTX_Q
+                    if WINDOW_SIZE_LEFT < 0:
+                        mask = col > row + (sk - sq) + WINDOW_SIZE_RIGHT
+                    else:
+                        right = tl.minimum(row + (sk - sq) + WINDOW_SIZE_RIGHT, sk)
+                        left  = row + (sk - sq) - WINDOW_SIZE_LEFT
+                        mask  = (col > right) | (col < left)
+                qk = tl.where(mask, float("-inf"), qk)
+            else:
+                if IS_CAUSAL:
+                    row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                    col_idx = start_n + tl.arange(0, BLOCK_N)
 
-                # Apply the mask
-                qk = tl.where(causal_mask, qk, float("-inf"))
+                    # create a N_CTX_Q x kv_len causal mask
+                    col_offset = N_CTX_Q - N_CTX_K_FINAL
+                    causal_mask = row_idx[:, None] >= (col_offset + col_idx[None, :])
 
-        # TODO: This is slow, and only needed at the last iteration.
-        # Maybe we can unroll the last iteration instead?
-        if BOUNDS_CHECKS_N:
-            qk = tl.where(tl.arange(0, BLOCK_N) < hi - start_n, qk, float("-inf"))
+                    # Apply the mask
+                    qk = tl.where(causal_mask, qk, float("-inf"))
 
-        m_i_new = tl.maximum(m_i, tl.max(qk, 1))           # per-row max so far
+            # TODO: This is slow, and only needed at the last iteration.
+            # Maybe we can unroll the last iteration instead?
+            if BOUNDS_CHECKS_N:
+                qk = tl.where(tl.arange(0, BLOCK_N) < hi - start_n, qk, float("-inf"))
 
-        # rows that are *all* -inf after masking
-        valid   = m_i_new > float("-inf")
+            m_i_new = tl.maximum(m_i, tl.max(qk, 1))           # per-row max so far
 
-        # scale previous partial sums safely
-        alpha   = tl.where(valid, tl.math.exp2(m_i - m_i_new), 0.0)
+            # rows that are *all* -inf after masking
+            valid   = m_i_new > float("-inf")
 
-        # subtract the row max only on valid rows
-        qk      = tl.where(valid[:, None], qk - m_i_new[:, None], float("-inf"))
-        p = tl.math.exp2(qk)
+            # scale previous partial sums safely
+            alpha   = tl.where(valid, tl.math.exp2(m_i - m_i_new), 0.0)
 
-        # -- update m_i and l_i --
-        l_i = l_i * alpha + tl.sum(p, 1)
-        m_i = m_i_new
-        p = p.to(Q.dtype.element_ty)
+            # subtract the row max only on valid rows
+            qk      = tl.where(valid[:, None], qk - m_i_new[:, None], float("-inf"))
+            p = tl.math.exp2(qk)
 
-        # -- scale and update acc --
-        acc *= alpha[:, None]
-        acc += tl.dot(p.to(v.dtype), v)
+            # -- update m_i and l_i --
+            l_i = l_i * alpha + tl.sum(p, 1)
+            m_i = m_i_new
+            p = p.to(Q.dtype.element_ty)
+
+            # -- scale and update acc --
+            acc *= alpha[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
 
     # write back O
     osk_offset = Out_splitK + pid_zhg * stride_osk_zhg + pid_splitk * stride_osk_s
@@ -598,6 +685,7 @@ def attention_decode_forward_triton_impl(
         layout: Literal["bshd"], 
         cache_seqlens: Optional[torch.Tensor], 
         cache_batch_idx: Optional[torch.Tensor],
+        block_table: Optional[torch.Tensor] = None,
 ):
     # triton configs
     BLOCK_M = 16
@@ -611,13 +699,41 @@ def attention_decode_forward_triton_impl(
     use_alibi, (stride_az, stride_ah) = True if alibi_slopes is not None else False,  alibi_slopes.stride() if alibi_slopes is not None else (None, None)
     use_cache_seqlens = cache_seqlens is not None
     use_sliding_window = window_size_left != -1 or window_size_right != -1
+    use_block_table = block_table is not None
     SPLIT_K = None
     NUM_QUANT_GROUPS = 1
 
     # get shapes and strides
     (batch_size, seqlen_q, nheads_q, dim_q), (stride_qz, stride_qh, stride_qm, stride_qd) = get_shape_and_strides_from_layout(q, layout)
-    (_, seqlen_kc, nheads_kc, dim_kc), (stride_kc_z, stride_kc_h, stride_kc_n, stride_kc_d) = get_shape_and_strides_from_layout(k_cache, layout)
-    (_, seqlen_vc, nheads_vc, dim_vc), (stride_vc_z, stride_vc_h, stride_vc_n, stride_vc_d) = get_shape_and_strides_from_layout(v_cache, layout)
+    
+    # Handle paged KV cache layout
+    if use_block_table:
+        # For paged attention, k_cache and v_cache have shape [num_blocks, block_size, nheads, head_dim]
+        num_blocks_kc, block_size_k, nheads_kc, dim_kc = k_cache.shape
+        num_blocks_vc, block_size_v, nheads_vc, dim_vc = v_cache.shape
+        # Get the actual sequence length from cache_seqlens or block_table
+        if cache_seqlens is not None:
+            seqlen_kc = int(cache_seqlens.max().item())
+        else:
+            # Infer from block_table shape [batch_size, num_blocks_per_seq]
+            num_blocks_per_seq = block_table.shape[1]
+            seqlen_kc = num_blocks_per_seq * block_size_k
+        seqlen_vc = seqlen_kc
+        
+        # Strides for paged layout
+        stride_kc_z = 0  # No batch dimension in paged cache
+        stride_kc_n = k_cache.stride(1)  # Sequence stride
+        stride_kc_h = k_cache.stride(2)  # Head stride
+        stride_kc_d = k_cache.stride(3)  # Dim stride
+        
+        stride_vc_z = 0
+        stride_vc_n = v_cache.stride(1)
+        stride_vc_h = v_cache.stride(2)
+        stride_vc_d = v_cache.stride(3)
+    else:
+        (_, seqlen_kc, nheads_kc, dim_kc), (stride_kc_z, stride_kc_h, stride_kc_n, stride_kc_d) = get_shape_and_strides_from_layout(k_cache, layout)
+        (_, seqlen_vc, nheads_vc, dim_vc), (stride_vc_z, stride_vc_h, stride_vc_n, stride_vc_d) = get_shape_and_strides_from_layout(v_cache, layout)
+        block_size_k = 0  # Not used
     if is_new_kv:
         ( _, seqlen_kn, nheads_kn, dim_kn), (stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d) = get_shape_and_strides_from_layout(k_new, layout)
         (_, seqlen_vn, nheads_vn, dim_vn), (stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d) = get_shape_and_strides_from_layout(v_new, layout)
@@ -657,8 +773,14 @@ def attention_decode_forward_triton_impl(
         split_k = SPLIT_K
     else:
         # Use heuristics
-        split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc) # NOTE: should the split think about seqlens?
-    split_size = (seqlen_kc + split_k - 1) // split_k
+        if use_block_table:
+            # For paged attention, use the actual sequence length from cache_seqlens
+            max_seqlen = int(cache_seqlens.max().item()) if cache_seqlens is not None else block_size_k
+            split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, max_seqlen)
+            split_size = (max_seqlen + split_k - 1) // split_k
+        else:
+            split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc)
+            split_size = (seqlen_kc + split_k - 1) // split_k
 
     # setup grid
     seqlen_q_ceil = (seqlen_q + BLOCK_M - 1) // BLOCK_M * BLOCK_M
@@ -673,6 +795,12 @@ def attention_decode_forward_triton_impl(
     stride_osk_zhg, stride_osk_s, stride_osk_m, stride_osk_d = out_splitk.stride()
     stride_mzhg, stride_m2, stride_ms, stride_mm = metadata.stride()
     stride_lse_zhg, stride_lse_m = lse.stride()
+    
+    # Block table strides
+    if use_block_table:
+        stride_bt_b, stride_bt_s = block_table.stride()
+    else:
+        stride_bt_b, stride_bt_s = 0, 0
 
     if DEBUG:
         print("batch_size, seqlen_q, nheads_q, dim_q", (batch_size, seqlen_q, nheads_q, dim_q))
@@ -701,6 +829,7 @@ def attention_decode_forward_triton_impl(
         V_new=v_new,
         Cache_seqlens=cache_seqlens,
         Cache_batch_idx=cache_batch_idx,
+        Block_table=block_table,
         Alibi_slopes=alibi_slopes,
         # q strides
         stride_qz=stride_qz,
@@ -742,6 +871,9 @@ def attention_decode_forward_triton_impl(
         stride_vn_g=stride_vn_g,
         stride_vn_h=stride_vn_h,
         stride_vn_d=stride_vn_d,
+        # block table strides
+        stride_bt_b=stride_bt_b,
+        stride_bt_s=stride_bt_s,
         # alibi strides
         stride_az=stride_az,
         stride_ah=stride_ah,
@@ -753,6 +885,7 @@ def attention_decode_forward_triton_impl(
         N_CTX_K=seqlen_kc,
         N_CTX_NEW=seqlen_kn,
         BLOCK_N_PER_SPLIT=split_size,
+        BLOCK_SIZE_K=block_size_k if use_block_table else 256,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=dim_padded,
@@ -769,6 +902,7 @@ def attention_decode_forward_triton_impl(
         USE_SLIDING_WINDOW=use_sliding_window,
         WINDOW_SIZE_LEFT=window_size_left,
         WINDOW_SIZE_RIGHT=window_size_right,
+        USE_BLOCK_TABLE=use_block_table,
         num_warps=num_warps_fwd,
         num_stages=num_stages,
     )
