@@ -46,20 +46,28 @@ def attention_forward_core_ref_impl(
         print(f"cache_seqlens: {cache_seqlens}")
     
     if is_paged:
-        # In paged mode, k and v are [num_blocks, block_size, nheads, head_dim]
+        # In paged mode, k and v are [num_blocks, block_size, nheads_k, head_dim]
         # We'll compute attention on-the-fly without reconstructing
-        nheads = q.shape[0]
+        nheads_q = q.shape[0]
         L_q = q.shape[1]
         head_dim = q.shape[2]
+        
+        # Get number of KV heads from the cache
+        nheads_k = k.shape[2]  # k shape: [num_blocks, block_size, nheads_k, head_dim]
+        
+        # Handle MQA/GQA
+        assert nheads_q % nheads_k == 0, f"nheads_q ({nheads_q}) must be divisible by nheads_k ({nheads_k})"
+        group_size = nheads_q // nheads_k
         
         # Determine the actual KV sequence length from cache_seqlens
         L_k = cache_seqlens if isinstance(cache_seqlens, int) else cache_seqlens.item()
         
-        print(f"L_q: {L_q}, L_k: {L_k}, nheads: {nheads}, head_dim: {head_dim}")
-        print(f"block_table contents: {block_table if block_table is not None else 'None'}")
+        if False:  # Debug disabled
+            print(f"L_q: {L_q}, L_k: {L_k}, nheads_q: {nheads_q}, nheads_k: {nheads_k}, group_size: {group_size}, head_dim: {head_dim}")
+            print(f"block_table contents: {block_table if block_table is not None else 'None'}")
         
         # Initialize attention scores
-        attention_scores = torch.zeros((nheads, L_q, L_k), dtype=torch.float32, device=q.device)
+        attention_scores = torch.zeros((nheads_q, L_q, L_k), dtype=torch.float32, device=q.device)
         
         # Compute attention scores on-the-fly by accessing blocks directly
         for kv_pos in range(L_k):
@@ -74,25 +82,33 @@ def attention_forward_core_ref_impl(
             else:
                 physical_block = block_table[block_idx].item()
             
-            if kv_pos == 0:
-                print(f"First KV access: block_idx={block_idx}, within_block={within_block_idx}, physical_block={physical_block}")
-                print(f"k_vec shape will be: {k[physical_block, within_block_idx, :, :].shape}")
+            # Debug output disabled
+            # if kv_pos == 0:
+            #     print(f"First KV access: block_idx={block_idx}, within_block={within_block_idx}, physical_block={physical_block}")
+            #     print(f"k_vec shape will be: {k[physical_block, within_block_idx, :, :].shape}")
             
             # Access k values directly from paged cache
-            # k shape: [num_blocks, block_size, nheads, head_dim]
-            k_vec = k[physical_block, within_block_idx, :, :].to(torch.float32)  # [nheads, head_dim]
+            # k shape: [num_blocks, block_size, nheads_k, head_dim]
+            k_vec = k[physical_block, within_block_idx, :, :].to(torch.float32)  # [nheads_k, head_dim]
+            
+            # For GQA/MQA, we need to repeat k_vec for each group
+            if group_size > 1:
+                # Expand k_vec to match query heads
+                # k_vec: [nheads_k, head_dim] -> [nheads_q, head_dim]
+                k_vec = k_vec.repeat_interleave(group_size, dim=0)
             
             # Compute dot product with all query positions
-            # q is [nheads, L_q, head_dim], k_vec is [nheads, head_dim]
-            # Result should be [nheads, L_q] for this kv_pos
+            # q is [nheads_q, L_q, head_dim], k_vec is [nheads_q, head_dim]
+            # Result should be [nheads_q, L_q] for this kv_pos
             attention_scores[:, :, kv_pos] = torch.sum(q * k_vec.unsqueeze(1), dim=-1)
         
         # Keep k and v in original format for later v computation
         k_paged = k
         v_paged = v
         
-        print(f"attention_scores computed shape: {attention_scores.shape}")
-        print(f"attention_scores sample values: {attention_scores[0, 0, :5]}")
+        # Debug output disabled
+        # print(f"attention_scores computed shape: {attention_scores.shape}")
+        # print(f"attention_scores sample values: {attention_scores[0, 0, :5]}")
     else:
         # Standard non-paged mode
         k = k.to(torch.float32)
@@ -324,11 +340,16 @@ def attention_forward_core_ref_impl(
     # Compute output
     if is_paged:
         # Compute output on-the-fly using paged v cache
-        nheads = p.shape[0]
+        nheads_q = p.shape[0]
         L_q = p.shape[1]
-        head_dim = v_paged.shape[3]  # [num_blocks, block_size, nheads, head_dim]
+        nheads_v = v_paged.shape[2]  # [num_blocks, block_size, nheads_v, head_dim]
+        head_dim = v_paged.shape[3]
         
-        o = torch.zeros((nheads, L_q, head_dim), dtype=torch.float32, device=p.device)
+        # Handle MQA/GQA for v
+        assert nheads_q % nheads_v == 0, f"nheads_q ({nheads_q}) must be divisible by nheads_v ({nheads_v})"
+        v_group_size = nheads_q // nheads_v
+        
+        o = torch.zeros((nheads_q, L_q, head_dim), dtype=torch.float32, device=p.device)
         
         # Accumulate weighted v values
         for kv_pos in range(L_k):
@@ -343,21 +364,28 @@ def attention_forward_core_ref_impl(
                 physical_block = block_table[block_idx].item()
             
             # Access v values directly from paged cache
-            # v_paged shape: [num_blocks, block_size, nheads, head_dim]
-            v_vec = v_paged[physical_block, within_block_idx, :, :].to(torch.float32)  # [nheads, head_dim]
+            # v_paged shape: [num_blocks, block_size, nheads_v, head_dim]
+            v_vec = v_paged[physical_block, within_block_idx, :, :].to(torch.float32)  # [nheads_v, head_dim]
+            
+            # For GQA/MQA, we need to repeat v_vec for each group
+            if v_group_size > 1:
+                # Expand v_vec to match query heads
+                # v_vec: [nheads_v, head_dim] -> [nheads_q, head_dim]
+                v_vec = v_vec.repeat_interleave(v_group_size, dim=0)
             
             # Weight by attention probabilities
-            # p is [nheads, L_q, L_k], we need p[:, :, kv_pos] which is [nheads, L_q]
-            # v_vec is [nheads, head_dim]
+            # p is [nheads_q, L_q, L_k], we need p[:, :, kv_pos] which is [nheads_q, L_q]
+            # v_vec is [nheads_q, head_dim]
             # We want to add p[:, :, kv_pos] * v_vec to each query position
-            weights = p[:, :, kv_pos].unsqueeze(-1)  # [nheads, L_q, 1]
-            o += weights * v_vec.unsqueeze(1)  # [nheads, L_q, head_dim]
+            weights = p[:, :, kv_pos].unsqueeze(-1)  # [nheads_q, L_q, 1]
+            o += weights * v_vec.unsqueeze(1)  # [nheads_q, L_q, head_dim]
     else:
         o = torch.matmul(p, v)
     
-    if False:  # Debug output (disabled for production)
-        print(f"Output o shape: {o.shape}")
-        print(f"Output o sample values: {o[0, 0, :5]}")
+    # Debug output disabled
+    # if False:
+    #     print(f"Output o shape: {o.shape}")
+    #     print(f"Output o sample values: {o[0, 0, :5]}")
     
     if DEBUG_CORE:
         print("o:", o, o.shape)
