@@ -316,6 +316,17 @@ def build_for_rocm():
         ],
         check=True,
     )
+
+    """apply patch for ROCm 7"""
+    subprocess.run(
+        [
+            "sh",
+            "-c",
+            "'patch -p1 < rocm7-fix.patch'"
+        ],
+        check=True,
+    )
+    print("ROCm 7 and gfx1151 patches applied.")
     ext_modules.append(
         CUDAExtension(
             name="flash_attn_2_cuda",
