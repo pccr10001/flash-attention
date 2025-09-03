@@ -243,6 +243,7 @@ def validate_and_update_archs(archs):
         "gfx1100",
         "gfx1101",
         "gfx1102",
+        "gfx1151",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -340,6 +341,8 @@ def build_for_rocm():
                     "-DNDEBUG",
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-Wno-error=invalid-constexpr",
+                    "-Wno-error=missing-template-arg-list-after-template-kw",
                 ]
                 + generator_flag
                 + cc_flag,
