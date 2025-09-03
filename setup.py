@@ -321,9 +321,12 @@ def build_for_rocm():
     """apply patch for ROCm 7"""
     subprocess.run(
         [
-            "sh",
-            "-c",
-            "'patch -p1 < rocm7-fix.patch'"
+            "patch",
+            "-i",
+            "rocm7-fix.patch",
+            "-N",
+            "-p1",
+            "-s"
         ],
         check=True,
     )
