@@ -1,25 +1,3 @@
-diff --git a/setup.py b/setup.py
-index 8a12b32..10d3e37 100644
---- a/setup.py
-+++ b/setup.py
-@@ -241,7 +241,7 @@ def validate_and_update_archs(archs):
-         "gfx941",
-         "gfx942",
-         "gfx1100",
--        "gfx1101",
-+        "gfx1151",
-         "gfx1102",
-     ]
- 
-@@ -329,6 +329,8 @@ def build_for_rocm():
-                     "-DNDEBUG",
-                     "-U__CUDA_NO_HALF_OPERATORS__",
-                     "-U__CUDA_NO_HALF_CONVERSIONS__",
-+                    "-Wno-error=invalid-constexpr",
-+                    "-Wno-error=missing-template-arg-list-after-template-kw",
-                 ]
-                 + generator_flag
-                 + cc_flag,
 diff --git a/csrc/flash_attn_rocm/composable_kernel/example/20_grouped_conv_bwd_weight/run_grouped_conv_bwd_weight_example.inc b/csrc/flash_attn_rocm/composable_kernel/example/20_grouped_conv_bwd_weight/run_grouped_conv_bwd_weight_example.inc
 index 49bd9fc7f..f94f4f2c0 100644
 --- a/csrc/flash_attn_rocm/composable_kernel/example/20_grouped_conv_bwd_weight/run_grouped_conv_bwd_weight_example.inc
